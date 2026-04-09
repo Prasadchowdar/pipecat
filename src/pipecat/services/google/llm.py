@@ -872,6 +872,8 @@ class GoogleLLMService(LLMService):
 
         # Store pending function calls that need to be executed after TTS
         self._pending_function_calls = []
+        # Background task running KB/tool calls in parallel with TTS playback
+        self._pending_function_task = None
 
         # Initialize the API client. Subclasses can override this if needed.
         self.create_client()
@@ -1095,6 +1097,7 @@ class GoogleLLMService(LLMService):
 
         # Reset pending function calls when processing a new context
         self._pending_function_calls = []
+        self._pending_function_task = None
 
         try:
             # Generate content using either OpenAILLMContext or universal LLMContext
@@ -1261,12 +1264,15 @@ class GoogleLLMService(LLMService):
                     direction=FrameDirection.DOWNSTREAM,
                 )
 
-                # If text was generated, defer function calls until after TTS plays
-                # Otherwise, execute them immediately
+                # If text was generated, start function calls in background (parallel with TTS).
+                # Otherwise, execute them immediately.
                 if text_generated_signal:
-                    self._pending_function_calls = function_calls
+                    self._pending_function_task = self.create_task(
+                        self.run_function_calls(function_calls),
+                        name="deferred_function_calls",
+                    )
                     logger.debug(
-                        f"{self}: Deferring {len(function_calls)} function calls until after TTS"
+                        f"{self}: Started {len(function_calls)} function calls in background (parallel with TTS)"
                     )
                 else:
                     logger.debug(f"{self}: Executing {len(function_calls)} function calls")
@@ -1304,14 +1310,12 @@ class GoogleLLMService(LLMService):
         """
         await super().process_frame(frame, direction)
 
-        # Handle BotStoppedSpeakingFrame to execute pending function calls
+        # Handle BotStoppedSpeakingFrame: await the background KB task if still running
         if isinstance(frame, BotStoppedSpeakingFrame):
-            if self._pending_function_calls:
-                logger.debug(
-                    f"{self}: Executing {len(self._pending_function_calls)} deferred function calls after TTS"
-                )
-                await self.run_function_calls(self._pending_function_calls)
-                self._pending_function_calls = []
+            if self._pending_function_task is not None:
+                logger.debug(f"{self}: Awaiting background function call task after TTS")
+                await self._pending_function_task
+                self._pending_function_task = None
             await self.push_frame(frame, direction)
             return
 
